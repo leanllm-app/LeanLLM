@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "leanllm"
+version = "0.1.0"
+description = "Lightweight LLM wrapper with usage tracking"
+requires-python = ">=3.10"
+dependencies = [
+    "litellm>=1.0",
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
