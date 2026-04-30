@@ -2,6 +2,7 @@
 
 Uses async SQLAlchemy + asyncpg so we don't need psycopg2 as a dependency.
 """
+
 from __future__ import annotations
 
 import asyncio

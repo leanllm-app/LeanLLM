@@ -1,4 +1,5 @@
 """Programmatic Alembic runner used by the CLI and PostgresEventStore.auto_migrate."""
+
 from __future__ import annotations
 
 import asyncio
@@ -17,9 +18,9 @@ def _normalize_postgres_url(url: str) -> str:
     if url.startswith("postgresql+"):
         return url
     if url.startswith("postgresql://"):
-        return "postgresql+asyncpg://" + url[len("postgresql://"):]
+        return "postgresql+asyncpg://" + url[len("postgresql://") :]
     if url.startswith("postgres://"):
-        return "postgresql+asyncpg://" + url[len("postgres://"):]
+        return "postgresql+asyncpg://" + url[len("postgres://") :]
     return url
 
 
@@ -61,6 +62,7 @@ def current_postgres(*, url: str) -> Optional[str]:
         engine = create_async_engine(_normalize_postgres_url(url), future=True)
         try:
             async with engine.connect() as conn:
+
                 def _get(sync_conn):
                     ctx = MigrationContext.configure(sync_conn)
                     return ctx.get_current_revision()

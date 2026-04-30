@@ -156,6 +156,7 @@ def classify_input_type(*, messages: List[Dict[str, str]]) -> InputType:
 # Entry points
 # ----------------------------------------------------------------------
 
+
 def _extract_input_text(*, messages: List[Dict[str, str]]) -> str:
     parts: List[str] = []
     for m in messages:

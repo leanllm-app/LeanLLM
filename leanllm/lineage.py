@@ -89,7 +89,9 @@ def parse_tool_calls(*, raw: Optional[List[Dict[str, Any]]]) -> List[ToolCallRec
             continue
         tool_call_id = tc.get("id") or tc.get("tool_call_id")
         function = tc.get("function") if isinstance(tc.get("function"), dict) else {}
-        name = function.get("name") or tc.get("name") or tc.get("tool_name") or "unknown"
+        name = (
+            function.get("name") or tc.get("name") or tc.get("tool_name") or "unknown"
+        )
         args_raw = function.get("arguments") if function else tc.get("arguments")
         arguments: Dict[str, Any] = {}
         if isinstance(args_raw, dict):

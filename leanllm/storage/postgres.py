@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, List
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
+from ._hydrate import field_names, row_to_event
 from .base import BaseEventStore
 
 if TYPE_CHECKING:
@@ -49,8 +51,12 @@ def _to_row(event: "LLMEvent") -> tuple:
         event.total_stream_time_ms,
         event.error_kind.value if event.error_kind else None,
         event.error_message,
-        json.dumps(event.normalized_input.model_dump(mode="json")) if event.normalized_input else None,
-        json.dumps(event.normalized_output.model_dump(mode="json")) if event.normalized_output else None,
+        json.dumps(event.normalized_input.model_dump(mode="json"))
+        if event.normalized_input
+        else None,
+        json.dumps(event.normalized_output.model_dump(mode="json"))
+        if event.normalized_output
+        else None,
     )
 
 
@@ -78,6 +84,7 @@ class PostgresEventStore(BaseEventStore):
         if self._auto_migrate:
             try:
                 from .migrations.runner import auto_migrate_postgres
+
                 await auto_migrate_postgres(url=self._url)
             except Exception:
                 logger.exception(
@@ -97,7 +104,124 @@ class PostgresEventStore(BaseEventStore):
         async with self._pool.acquire() as conn:
             await conn.executemany(_INSERT, rows)
 
+    # ------------------------------------------------------------------
+    # Read API (Module 12)
+    # ------------------------------------------------------------------
+
+    async def get_event(self, *, event_id: str) -> "Optional[LLMEvent]":
+        if self._pool is None:
+            return None
+        select_cols = ", ".join(field_names())
+        async with self._pool.acquire() as conn:
+            record = await conn.fetchrow(
+                f"SELECT {select_cols} FROM llm_events WHERE event_id = $1",
+                event_id,
+            )
+        if record is None:
+            return None
+        try:
+            return row_to_event(_record_to_dict(record))
+        except Exception:
+            logger.exception("[LeanLLM] Failed to hydrate event %s", event_id)
+            return None
+
+    async def list_events(
+        self,
+        *,
+        correlation_id: Optional[str] = None,
+        model: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        errors_only: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> "List[LLMEvent]":
+        if self._pool is None:
+            return []
+        where, params = _build_where(
+            correlation_id=correlation_id,
+            model=model,
+            since=since,
+            until=until,
+            errors_only=errors_only,
+        )
+        select_cols = ", ".join(field_names())
+        sql = (
+            f"SELECT {select_cols} FROM llm_events {where} "
+            f"ORDER BY timestamp DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
+        )
+        async with self._pool.acquire() as conn:
+            records = await conn.fetch(sql, *params, limit, offset)
+        events: List["LLMEvent"] = []
+        for record in records:
+            try:
+                events.append(row_to_event(_record_to_dict(record)))
+            except Exception:
+                logger.exception(
+                    "[LeanLLM] Skipping un-hydratable row event_id=%s",
+                    record.get("event_id"),
+                )
+        return events
+
+    async def count_events(
+        self,
+        *,
+        correlation_id: Optional[str] = None,
+        model: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        errors_only: bool = False,
+    ) -> int:
+        if self._pool is None:
+            return 0
+        where, params = _build_where(
+            correlation_id=correlation_id,
+            model=model,
+            since=since,
+            until=until,
+            errors_only=errors_only,
+        )
+        sql = f"SELECT COUNT(*) FROM llm_events {where}"
+        async with self._pool.acquire() as conn:
+            value = await conn.fetchval(sql, *params)
+        return int(value or 0)
+
     async def close(self) -> None:
         if self._pool:
             await self._pool.close()
             self._pool = None
+
+
+def _record_to_dict(record: Any) -> Dict[str, Any]:
+    """asyncpg.Record → plain dict, leaving JSONB values as native dicts/lists."""
+    return dict(record)
+
+
+def _build_where(
+    *,
+    correlation_id: Optional[str],
+    model: Optional[str],
+    since: Optional[datetime],
+    until: Optional[datetime],
+    errors_only: bool,
+) -> Tuple[str, list]:
+    """Build a WHERE clause + ordered params for asyncpg '$N' placeholders."""
+    clauses: List[str] = []
+    params: List[Any] = []
+    if correlation_id is not None:
+        params.append(correlation_id)
+        clauses.append(f"correlation_id = ${len(params)}")
+    if model is not None:
+        params.append(model)
+        clauses.append(f"model = ${len(params)}")
+    if since is not None:
+        params.append(since)
+        clauses.append(f"timestamp >= ${len(params)}")
+    if until is not None:
+        params.append(until)
+        clauses.append(f"timestamp <= ${len(params)}")
+    if errors_only:
+        clauses.append("error_kind IS NOT NULL")
+    if not clauses:
+        return "", []
+    return "WHERE " + " AND ".join(clauses), params

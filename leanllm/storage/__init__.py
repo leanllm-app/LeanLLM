@@ -35,7 +35,9 @@ def create_store(
         scheme = urlparse(database_url).scheme.lower()
 
         if scheme.startswith("postgres"):
-            return PostgresEventStore(database_url=database_url, auto_migrate=auto_migrate)
+            return PostgresEventStore(
+                database_url=database_url, auto_migrate=auto_migrate
+            )
 
         if scheme == "sqlite":
             return SQLiteEventStore(database_url=database_url)

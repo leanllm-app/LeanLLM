@@ -8,9 +8,9 @@ from pydantic import BaseModel, Field
 
 
 class RedactionMode(str, Enum):
-    FULL = "full"                # store prompt + response as-is
-    REDACTED = "redacted"        # apply masking rules before storing
-    METADATA_ONLY = "metadata"   # never store prompt/response
+    FULL = "full"  # store prompt + response as-is
+    REDACTED = "redacted"  # apply masking rules before storing
+    METADATA_ONLY = "metadata"  # never store prompt/response
 
 
 class RedactionPolicy(BaseModel):
@@ -25,7 +25,7 @@ class RedactionPolicy(BaseModel):
 
     redact_emails: bool = True
     redact_phones: bool = True
-    redact_ids: bool = True          # CPF / SSN style patterns
+    redact_ids: bool = True  # CPF / SSN style patterns
 
     custom_patterns: List[str] = Field(default_factory=list)
 

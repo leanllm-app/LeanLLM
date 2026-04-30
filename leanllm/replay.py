@@ -3,10 +3,11 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, TextIO
 
 from pydantic import BaseModel
 
@@ -47,6 +48,46 @@ class ReplayResult(BaseModel):
     latency_ms_after: int = 0
     latency_ms_delta: int = 0
 
+    def summary(self) -> str:
+        """One-line, human-readable description of this replay outcome."""
+        if self.error_message:
+            return f"replay {self.original_request_id} → ERROR: {self.error_message}"
+        marker = "≡ identical" if self.text_identical else "Δ different"
+        return (
+            f"replay {self.original_request_id} → {self.new_request_id}: "
+            f"text {marker}, tokens {self.tokens_delta:+d}, "
+            f"latency {self.latency_ms_delta:+d}ms"
+        )
+
+    def pretty_print(self, file: Optional[TextIO] = None) -> None:
+        """Print a sectioned view of this replay result, including any diff."""
+        out = file if file is not None else sys.stdout
+        lines: List[str] = []
+        lines.append(f"━━━━ Replay {self.original_request_id} ━━━━")
+        if self.error_message:
+            lines.append("  status:  ERROR")
+            lines.append(f"  message: {self.error_message}")
+            out.write("\n".join(lines) + "\n")
+            return
+
+        lines.append(f"  new_request_id: {self.new_request_id}")
+        lines.append(
+            f"  text:     {'identical' if self.text_identical else 'different'}"
+        )
+        lines.append(
+            f"  tokens:   before={self.tokens_before}  after={self.tokens_after}  "
+            f"delta={self.tokens_delta:+d}"
+        )
+        lines.append(
+            f"  latency:  before={self.latency_ms_before}ms  "
+            f"after={self.latency_ms_after}ms  delta={self.latency_ms_delta:+d}ms"
+        )
+        if self.text_diff:
+            lines.append("")
+            lines.append("  ── diff ──")
+            lines.append(self.text_diff.rstrip("\n"))
+        out.write("\n".join(lines) + "\n")
+
 
 class ReplayEngine:
     """Deterministic replay of past LLM events.
@@ -83,7 +124,9 @@ class ReplayEngine:
         )
 
         new_request_id = str(uuid.uuid4())
-        call_kwargs: Dict[str, Any] = {k: v for k, v in parameters.items() if k != "stream"}
+        call_kwargs: Dict[str, Any] = {
+            k: v for k, v in parameters.items() if k != "stream"
+        }
         if tools:
             call_kwargs["tools"] = tools
 
@@ -103,6 +146,23 @@ class ReplayEngine:
             new_latency_ms=new_latency_ms,
             new_request_id=new_request_id,
         )
+
+    async def replay_by_id(
+        self,
+        *,
+        event_id: str,
+        overrides: Optional[ReplayOverrides] = None,
+    ) -> ReplayResult:
+        """Fetch an event from the configured store, then replay it.
+
+        Convenience wrapper for the common "I have a request_id, run it again"
+        flow. Async because storage reads are async (Module 12); the actual
+        replay still goes through the sync `chat()` path.
+        """
+        event = await self._client.get_event(event_id=event_id)
+        if event is None:
+            raise ValueError(f"Event {event_id} not found in the configured store.")
+        return self.replay(event=event, overrides=overrides)
 
     def replay_batch(
         self,
@@ -129,7 +189,8 @@ class ReplayEngine:
                 except Exception as exc:
                     logger.warning(
                         "[LeanLLM] Replay failed: original_id=%s err=%s",
-                        events[idx].event_id, exc,
+                        events[idx].event_id,
+                        exc,
                     )
                     results[idx] = ReplayResult(
                         original_request_id=events[idx].event_id,

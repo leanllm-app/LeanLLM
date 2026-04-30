@@ -3,6 +3,7 @@
 from leanllm import LeanLLM
 import os
 
+
 def main():
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:

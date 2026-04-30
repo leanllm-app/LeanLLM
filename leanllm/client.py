@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+import asyncio
+import collections
 import json
 import logging
+import random
+import sys
 import time
 import uuid
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
+from datetime import datetime
+from typing import Any, Callable, Deque, Dict, Iterator, List, Optional, Tuple
 
 from .config import LeanLLMConfig
-from .context import LeanLLMContext, get_current_context
+from .context import (
+    LeanLLMContext,
+    get_auto_chain_parent,
+    get_current_context,
+    set_auto_chain_parent,
+)
 from .events.cost import CostCalculator, estimate_tokens, extract_provider
 from .events.models import ErrorKind, LLMEvent
 from .events.queue import EventQueue
@@ -23,15 +33,34 @@ from .normalizer import (
 from .proxy import chat_completion
 from .redaction import RedactionMode, RedactionPolicy, apply as apply_redaction
 from .storage import create_store
+from .storage.base import BaseEventStore
 
 logger = logging.getLogger(__name__)
 
 
-_CAPTURED_PARAMETERS = frozenset({
-    "temperature", "max_tokens", "top_p", "frequency_penalty",
-    "presence_penalty", "stop", "n", "seed", "response_format",
-    "user", "logprobs", "top_logprobs", "stream",
-})
+_PERSISTENCE_DISABLED_MSG = (
+    "LeanLLM persistence is disabled — set LEANLLM_DATABASE_URL "
+    "(Postgres or SQLite) to enable get_event / list_events."
+)
+
+
+_CAPTURED_PARAMETERS = frozenset(
+    {
+        "temperature",
+        "max_tokens",
+        "top_p",
+        "frequency_penalty",
+        "presence_penalty",
+        "stop",
+        "n",
+        "seed",
+        "response_format",
+        "user",
+        "logprobs",
+        "top_logprobs",
+        "stream",
+    }
+)
 
 
 PreCallHook = Callable[[Dict[str, Any]], None]
@@ -61,6 +90,26 @@ def _tool_call_to_dict(tc: Any) -> Dict[str, Any]:
     return {"raw": repr(tc)}
 
 
+def _resolve_environment(
+    *,
+    config: LeanLLMConfig,
+    context: Optional[LeanLLMContext],
+) -> Optional[str]:
+    """Per-call context wins over global config (Module 14 precedence rule)."""
+    if context is not None and context.environment is not None:
+        return context.environment
+    return config.environment
+
+
+def _should_sample(*, rate: float) -> bool:
+    """Cheap producer-side sampling decision. No I/O — runs on the request thread."""
+    if rate >= 1.0:
+        return True
+    if rate <= 0.0:
+        return False
+    return random.random() < rate
+
+
 class LeanLLM:
     """
     Lightweight LLM client with a non-blocking async event pipeline.
@@ -81,6 +130,7 @@ class LeanLLM:
         pre_call_hook: Optional[PreCallHook] = None,
         post_call_hook: Optional[PostCallHook] = None,
         error_hook: Optional[ErrorHook] = None,
+        on_dropped_events: Optional[Callable[[int, str], None]] = None,
     ) -> None:
         self.api_key = api_key
         self._config = config or LeanLLMConfig.from_env()
@@ -88,15 +138,28 @@ class LeanLLM:
         self._pre_call_hook = pre_call_hook
         self._post_call_hook = post_call_hook
         self._error_hook = error_hook
+        self._on_dropped_events = on_dropped_events
 
         self._queue: Optional[EventQueue] = None
         self._worker: Optional[EventWorker] = None
+        self._store: Optional[BaseEventStore] = None
+
+        # Module 16 — in-memory ring buffer for last_event / recent_events.
+        # Disabled when buffer size is <= 0.
+        buffer_size = max(0, self._config.last_event_buffer)
+        self._recent_events: Deque[LLMEvent] = collections.deque(
+            maxlen=buffer_size or 1
+        )
+        self._recent_events_enabled = buffer_size > 0
+
+        if self._config.debug:
+            logging.getLogger("leanllm").setLevel(logging.DEBUG)
 
         has_destination = self._config.database_url or self._config.leanllm_api_key
 
         if self._config.enable_persistence and has_destination:
             self._queue = EventQueue(max_size=self._config.queue_max_size)
-            store = create_store(
+            self._store = create_store(
                 database_url=self._config.database_url,
                 api_key=self._config.leanllm_api_key,
                 endpoint=self._config.endpoint,
@@ -104,9 +167,13 @@ class LeanLLM:
             )
             self._worker = EventWorker(
                 queue=self._queue,
-                store=store,
+                store=self._store,
                 batch_size=self._config.batch_size,
                 flush_interval_ms=self._config.flush_interval_ms,
+                max_retries=self._config.retry_max_attempts,
+                initial_backoff_ms=self._config.retry_initial_backoff_ms,
+                total_budget_ms=self._config.retry_total_budget_ms,
+                on_dropped=self._on_dropped_events,
             )
             self._worker.start()
         elif self._config.enable_persistence:
@@ -114,6 +181,51 @@ class LeanLLM:
                 "[LeanLLM] No LEANLLM_DATABASE_URL or LEANLLM_API_KEY set — "
                 "events will not be persisted."
             )
+
+    # ------------------------------------------------------------------
+    # In-memory inspection (Module 16) — pure process memory, not storage.
+    # ------------------------------------------------------------------
+
+    @property
+    def last_event(self) -> Optional[LLMEvent]:
+        """Most recently emitted event (in this process), or None."""
+        if not self._recent_events_enabled or not self._recent_events:
+            return None
+        return self._recent_events[-1]
+
+    def recent_events(self, n: int = 8) -> List[LLMEvent]:
+        """Return the most recent `n` events from the in-memory ring buffer."""
+        if not self._recent_events_enabled or not self._recent_events:
+            return []
+        if n <= 0:
+            return []
+        return list(self._recent_events)[-n:]
+
+    # ------------------------------------------------------------------
+    # Delivery health (Module 15) — visible counters for ops alerting.
+    # ------------------------------------------------------------------
+
+    @property
+    def dropped_events_count(self) -> int:
+        """Total events dropped — queue-full drops + worker-side post-retry drops."""
+        queue_drops = self._queue.dropped if self._queue is not None else 0
+        worker_drops = (
+            self._worker.dropped_events_count if self._worker is not None else 0
+        )
+        return queue_drops + worker_drops
+
+    @property
+    def events_in_flight(self) -> int:
+        """Events the SDK is responsible for but hasn't persisted yet.
+
+        Sum of: events buffered in the queue waiting to be drained, plus events
+        currently being saved/retried by the worker. Read-only; safe to poll.
+        """
+        if self._queue is None:
+            return 0
+        in_queue = self._queue._q.qsize()
+        in_flight = self._worker.inflight_count if self._worker is not None else 0
+        return in_queue + in_flight
 
     # ------------------------------------------------------------------
     # Public API
@@ -129,13 +241,31 @@ class LeanLLM:
         correlation_id: Optional[str] = None,
         parent_request_id: Optional[str] = None,
         context: Optional[LeanLLMContext] = None,
+        log: bool = True,
+        sample: Optional[float] = None,
+        redaction_mode: Optional[RedactionMode] = None,
         **kwargs: Any,
     ) -> Any:
         """Send a chat completion request.
 
         Returns the raw LiteLLM `ModelResponse` for non-streaming calls,
         or an iterator of chunks when `stream=True`.
+
+        Module 14 toggles (keyword-only):
+          log=False    → bypass everything (no hooks, no event, no enqueue).
+          sample=...   → per-call sampling rate override (0.0..1.0).
+          redaction_mode=... → per-call RedactionMode override.
         """
+        # log=False is a hard bypass: don't even build context. Use cases:
+        # health checks, hot-path probes, anything the user explicitly opts out of.
+        if not log:
+            return chat_completion(
+                model=model,
+                messages=messages,
+                api_key=self.api_key,
+                **kwargs,
+            )
+
         ambient = context if context is not None else get_current_context()
         effective_correlation = correlation_id or (
             ambient.correlation_id if ambient is not None else None
@@ -143,8 +273,27 @@ class LeanLLM:
         effective_parent = parent_request_id or (
             ambient.parent_request_id if ambient is not None else None
         )
+        # Auto-chain (Module 16): only fills the gap when no explicit parent was
+        # provided AND the ambient context didn't supply one. Explicit kwargs and
+        # explicit Chain.kwargs() always win.
+        if effective_parent is None and self._config.auto_chain:
+            effective_parent = get_auto_chain_parent()
         merged_labels = (
-            ambient.merged_labels(extra=labels) if ambient is not None else (labels or {})
+            ambient.merged_labels(extra=labels)
+            if ambient is not None
+            else (labels or {})
+        )
+        environment = _resolve_environment(config=self._config, context=ambient)
+
+        # Producer-side sampling decision: cheap (one random.random() call), runs
+        # on the request thread, no I/O. Decision is made BEFORE _build_event,
+        # so sampled-out calls don't pay for event construction. Errors bypass.
+        sampling_rate = sample if sample is not None else self._config.sampling_rate
+        sampled_in = _should_sample(rate=sampling_rate)
+        effective_redaction = (
+            redaction_mode
+            if redaction_mode is not None
+            else self._config.redaction_mode
         )
 
         stream = bool(kwargs.get("stream"))
@@ -155,6 +304,9 @@ class LeanLLM:
             request_id=request_id,
             correlation_id=effective_correlation,
             parent_request_id=effective_parent,
+            environment=environment,
+            redaction_mode=effective_redaction,
+            sampled_in=sampled_in,
         )
         self._fire_pre_call(snapshot=pre_call)
 
@@ -169,23 +321,100 @@ class LeanLLM:
         start = time.perf_counter()
         try:
             response = chat_completion(
-                model=model, messages=messages, api_key=self.api_key, **kwargs,
+                model=model,
+                messages=messages,
+                api_key=self.api_key,
+                **kwargs,
             )
         except Exception as exc:
             latency_ms = int((time.perf_counter() - start) * 1000)
+            # Errors always emit, regardless of sampling — operational signal.
             self._emit_error(
-                pre_call=pre_call, labels=merged_labels,
-                latency_ms=latency_ms, exc=exc,
+                pre_call=pre_call,
+                labels=merged_labels,
+                latency_ms=latency_ms,
+                exc=exc,
             )
             self._fire_error(exc=exc, pre_call=pre_call)
             raise
 
         latency_ms = int((time.perf_counter() - start) * 1000)
-        self._emit(
-            pre_call=pre_call, labels=merged_labels,
-            response=response, latency_ms=latency_ms,
-        )
+        if sampled_in:
+            self._emit(
+                pre_call=pre_call,
+                labels=merged_labels,
+                response=response,
+                latency_ms=latency_ms,
+            )
         return response
+
+    # ------------------------------------------------------------------
+    # Read API (Module 12) — async, runs cross-thread on the worker loop
+    # so the request thread never blocks on DB I/O.
+    # ------------------------------------------------------------------
+
+    async def get_event(self, *, event_id: str) -> Optional[LLMEvent]:
+        return await self._run_on_worker(
+            lambda store: store.get_event(event_id=event_id),
+        )
+
+    async def list_events(
+        self,
+        *,
+        correlation_id: Optional[str] = None,
+        model: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        errors_only: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[LLMEvent]:
+        return await self._run_on_worker(
+            lambda store: store.list_events(
+                correlation_id=correlation_id,
+                model=model,
+                since=since,
+                until=until,
+                errors_only=errors_only,
+                limit=limit,
+                offset=offset,
+            ),
+        )
+
+    async def count_events(
+        self,
+        *,
+        correlation_id: Optional[str] = None,
+        model: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        errors_only: bool = False,
+    ) -> int:
+        return await self._run_on_worker(
+            lambda store: store.count_events(
+                correlation_id=correlation_id,
+                model=model,
+                since=since,
+                until=until,
+                errors_only=errors_only,
+            ),
+        )
+
+    async def _run_on_worker(self, factory: Callable[[BaseEventStore], Any]) -> Any:
+        """Submit a coroutine factory to the worker loop and await its result.
+
+        The store's connection pool is bound to the worker's asyncio loop, so we
+        cross-post the coroutine via `run_coroutine_threadsafe` and wrap the
+        resulting concurrent.futures.Future as an asyncio Future on the caller's
+        loop. The caller awaits without blocking its own loop.
+        """
+        if self._store is None or self._worker is None or self._worker._loop is None:
+            raise RuntimeError(_PERSISTENCE_DISABLED_MSG)
+        future = asyncio.run_coroutine_threadsafe(
+            factory(self._store),
+            self._worker._loop,
+        )
+        return await asyncio.wrap_future(future)
 
     def completion(
         self,
@@ -197,6 +426,9 @@ class LeanLLM:
         correlation_id: Optional[str] = None,
         parent_request_id: Optional[str] = None,
         context: Optional[LeanLLMContext] = None,
+        log: bool = True,
+        sample: Optional[float] = None,
+        redaction_mode: Optional[RedactionMode] = None,
         **kwargs: Any,
     ) -> Any:
         """Convenience wrapper: single string prompt → chat completion."""
@@ -208,6 +440,9 @@ class LeanLLM:
             correlation_id=correlation_id,
             parent_request_id=parent_request_id,
             context=context,
+            log=log,
+            sample=sample,
+            redaction_mode=redaction_mode,
             **kwargs,
         )
 
@@ -226,20 +461,27 @@ class LeanLLM:
         start = time.perf_counter()
         try:
             iterator = chat_completion(
-                model=pre_call["model"], messages=messages,
-                api_key=self.api_key, **kwargs,
+                model=pre_call["model"],
+                messages=messages,
+                api_key=self.api_key,
+                **kwargs,
             )
         except Exception as exc:
             latency_ms = int((time.perf_counter() - start) * 1000)
             self._emit_error(
-                pre_call=pre_call, labels=labels,
-                latency_ms=latency_ms, exc=exc,
+                pre_call=pre_call,
+                labels=labels,
+                latency_ms=latency_ms,
+                exc=exc,
             )
             self._fire_error(exc=exc, pre_call=pre_call)
             raise
 
         return self._wrap_stream(
-            iterator=iterator, pre_call=pre_call, labels=labels, start=start,
+            iterator=iterator,
+            pre_call=pre_call,
+            labels=labels,
+            start=start,
         )
 
     def _wrap_stream(
@@ -272,13 +514,18 @@ class LeanLLM:
             )
             if error is None:
                 self._emit_stream(
-                    pre_call=pre_call, labels=labels, chunks=chunks,
-                    latency_ms=total_ms, ttft_ms=ttft_ms,
+                    pre_call=pre_call,
+                    labels=labels,
+                    chunks=chunks,
+                    latency_ms=total_ms,
+                    ttft_ms=ttft_ms,
                 )
             else:
                 self._emit_error(
-                    pre_call=pre_call, labels=labels,
-                    latency_ms=total_ms, exc=error,
+                    pre_call=pre_call,
+                    labels=labels,
+                    latency_ms=total_ms,
+                    exc=error,
                 )
                 self._fire_error(exc=error, pre_call=pre_call)
 
@@ -294,7 +541,8 @@ class LeanLLM:
         except Exception:
             logger.exception(
                 "[LeanLLM] pre_call_hook raised: request_id=%s model=%s",
-                snapshot.get("request_id"), snapshot.get("model"),
+                snapshot.get("request_id"),
+                snapshot.get("model"),
             )
 
     def _fire_post_call(self, *, event: LLMEvent) -> None:
@@ -305,7 +553,8 @@ class LeanLLM:
         except Exception:
             logger.exception(
                 "[LeanLLM] post_call_hook raised: event_id=%s model=%s",
-                event.event_id, event.model,
+                event.event_id,
+                event.model,
             )
 
     def _fire_error(self, *, exc: Exception, pre_call: Dict[str, Any]) -> None:
@@ -316,7 +565,9 @@ class LeanLLM:
         except Exception:
             logger.exception(
                 "[LeanLLM] error_hook raised: request_id=%s model=%s orig=%s",
-                pre_call.get("request_id"), pre_call.get("model"), exc,
+                pre_call.get("request_id"),
+                pre_call.get("model"),
+                exc,
             )
 
     # ------------------------------------------------------------------
@@ -333,8 +584,10 @@ class LeanLLM:
     ) -> None:
         try:
             event = self._build_event_from_response(
-                pre_call=pre_call, labels=labels,
-                response=response, latency_ms=latency_ms,
+                pre_call=pre_call,
+                labels=labels,
+                response=response,
+                latency_ms=latency_ms,
             )
         except Exception:
             logger.exception("[LeanLLM] Failed to build event — skipping.")
@@ -353,8 +606,11 @@ class LeanLLM:
     ) -> None:
         try:
             event = self._build_event_from_stream(
-                pre_call=pre_call, labels=labels, chunks=chunks,
-                latency_ms=latency_ms, ttft_ms=ttft_ms,
+                pre_call=pre_call,
+                labels=labels,
+                chunks=chunks,
+                latency_ms=latency_ms,
+                ttft_ms=ttft_ms,
             )
         except Exception:
             logger.exception("[LeanLLM] Failed to build stream event — skipping.")
@@ -372,8 +628,10 @@ class LeanLLM:
     ) -> None:
         try:
             event = self._build_error_event(
-                pre_call=pre_call, labels=labels,
-                latency_ms=latency_ms, exc=exc,
+                pre_call=pre_call,
+                labels=labels,
+                latency_ms=latency_ms,
+                exc=exc,
             )
         except Exception:
             logger.exception("[LeanLLM] Failed to build error event — skipping.")
@@ -381,6 +639,19 @@ class LeanLLM:
         self._enqueue(event=event)
 
     def _enqueue(self, *, event: LLMEvent) -> None:
+        if self._config.debug:
+            print(event.summary(), file=sys.stderr)
+        # Module 16: in-memory ring buffer for client.last_event / recent_events.
+        # Populated regardless of whether persistence is configured — useful when
+        # the user is exploring with `enable_persistence=False`.
+        if self._recent_events_enabled:
+            self._recent_events.append(event)
+        # Module 16: auto-chain advances on every emitted event (success or error).
+        # Sampled-out events don't reach _enqueue, so they don't advance the chain
+        # — documented consequence: aggressive sampling can leave chains with
+        # parent_request_ids pointing to events that weren't persisted.
+        if self._config.auto_chain:
+            set_auto_chain_parent(event_id=event.event_id)
         if self._queue is None:
             return
         self._queue.enqueue(event)
@@ -398,6 +669,9 @@ class LeanLLM:
         request_id: Optional[str],
         correlation_id: Optional[str],
         parent_request_id: Optional[str],
+        environment: Optional[str] = None,
+        redaction_mode: Optional[RedactionMode] = None,
+        sampled_in: bool = True,
     ) -> Dict[str, Any]:
         parameters = {k: v for k, v in kwargs.items() if k in _CAPTURED_PARAMETERS}
         tools = kwargs.get("tools") or kwargs.get("functions")
@@ -410,6 +684,11 @@ class LeanLLM:
             "messages": messages,
             "parameters": parameters,
             "tools": tools,
+            "environment": environment,
+            "redaction_mode": redaction_mode
+            if redaction_mode is not None
+            else self._config.redaction_mode,
+            "sampled_in": sampled_in,
         }
 
     def _capture_content(
@@ -417,15 +696,20 @@ class LeanLLM:
         *,
         messages: List[Dict[str, str]],
         content: Optional[str],
+        redaction_mode: Optional[RedactionMode] = None,
     ) -> Tuple[Optional[str], Optional[str]]:
-        # Redaction policy controls content capture behavior
-        policy = RedactionPolicy(mode=self._config.redaction_mode)
+        # Redaction policy controls content capture behavior. Per-call override
+        # (Module 14) takes precedence over `config.redaction_mode`.
+        mode = (
+            redaction_mode
+            if redaction_mode is not None
+            else self._config.redaction_mode
+        )
+        policy = RedactionPolicy(mode=mode)
 
-        # Build raw content
         prompt_text = json.dumps(messages) if messages else None
         response_text = content
 
-        # Apply redaction based on policy
         prompt_text = apply_redaction(policy=policy, text=prompt_text)
         response_text = apply_redaction(policy=policy, text=response_text)
 
@@ -492,11 +776,19 @@ class LeanLLM:
         cost = self._cost.calculate(pre_call["model"], input_tokens, output_tokens)
 
         prompt_text, response_text = self._capture_content(
-            messages=pre_call["messages"], content=content,
+            messages=pre_call["messages"],
+            content=content,
+            redaction_mode=pre_call.get("redaction_mode"),
         )
         normalized_input, normalized_output = self._normalize(
-            messages=pre_call["messages"], content=content, tool_calls=tool_calls,
+            messages=pre_call["messages"],
+            content=content,
+            tool_calls=tool_calls,
         )
+
+        metadata: Dict[str, Any] = {"finish_reason": finish_reason}
+        if pre_call.get("environment") is not None:
+            metadata["environment"] = pre_call["environment"]
 
         return LLMEvent(
             event_id=pre_call["request_id"],
@@ -517,7 +809,7 @@ class LeanLLM:
             response=response_text,
             normalized_input=normalized_input,
             normalized_output=normalized_output,
-            metadata={"finish_reason": finish_reason},
+            metadata=metadata,
         )
 
     def _build_event_from_stream(
@@ -576,13 +868,19 @@ class LeanLLM:
         cost = self._cost.calculate(pre_call["model"], input_tokens, output_tokens)
 
         prompt_text, response_text = self._capture_content(
-            messages=pre_call["messages"], content=full_text,
+            messages=pre_call["messages"],
+            content=full_text,
+            redaction_mode=pre_call.get("redaction_mode"),
         )
         normalized_input, normalized_output = self._normalize(
             messages=pre_call["messages"],
             content=full_text,
             tool_calls=tool_calls_raw or None,
         )
+
+        metadata: Dict[str, Any] = {"finish_reason": finish_reason, "stream": True}
+        if pre_call.get("environment") is not None:
+            metadata["environment"] = pre_call["environment"]
 
         return LLMEvent(
             event_id=pre_call["request_id"],
@@ -605,7 +903,7 @@ class LeanLLM:
             response=response_text,
             normalized_input=normalized_input,
             normalized_output=normalized_output,
-            metadata={"finish_reason": finish_reason, "stream": True},
+            metadata=metadata,
         )
 
     def _build_error_event(
@@ -617,8 +915,13 @@ class LeanLLM:
         exc: Exception,
     ) -> LLMEvent:
         prompt_text, _ = self._capture_content(
-            messages=pre_call["messages"], content=None,
+            messages=pre_call["messages"],
+            content=None,
+            redaction_mode=pre_call.get("redaction_mode"),
         )
+        metadata: Dict[str, Any] = {"error_class": exc.__class__.__name__}
+        if pre_call.get("environment") is not None:
+            metadata["environment"] = pre_call["environment"]
         return LLMEvent(
             event_id=pre_call["request_id"],
             correlation_id=pre_call["correlation_id"],
@@ -636,5 +939,5 @@ class LeanLLM:
             prompt=prompt_text,
             error_kind=_classify_error(exc),
             error_message=str(exc),
-            metadata={"error_class": exc.__class__.__name__},
+            metadata=metadata,
         )

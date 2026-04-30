@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "leanllm-ai"
-version = "0.3.0"
+version = "1.0.0"
 description = "Lightweight LLM wrapper with async event pipeline, multi-backend persistence and migrations"
 readme = "README.md"
 license = "MIT"
@@ -14,7 +14,7 @@ authors = [
 ]
 keywords = ["llm", "litellm", "openai", "tracking", "observability", "analytics", "cost"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

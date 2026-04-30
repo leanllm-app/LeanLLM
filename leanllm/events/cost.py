@@ -8,30 +8,30 @@ logger = logging.getLogger(__name__)
 # (input_usd_per_1M_tokens, output_usd_per_1M_tokens)
 _PRICING: Dict[str, Tuple[float, float]] = {
     # OpenAI
-    "gpt-4o":               (2.50,  10.00),
-    "gpt-4o-mini":          (0.15,   0.60),
-    "gpt-4-turbo":          (10.00, 30.00),
-    "gpt-4":                (30.00, 60.00),
-    "gpt-3.5-turbo":        (0.50,   1.50),
-    "o1":                   (15.00, 60.00),
-    "o1-mini":              (3.00,  12.00),
-    "o3-mini":              (1.10,   4.40),
+    "gpt-4o": (2.50, 10.00),
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4-turbo": (10.00, 30.00),
+    "gpt-4": (30.00, 60.00),
+    "gpt-3.5-turbo": (0.50, 1.50),
+    "o1": (15.00, 60.00),
+    "o1-mini": (3.00, 12.00),
+    "o3-mini": (1.10, 4.40),
     # Anthropic
-    "claude-3-5-sonnet-20241022": (3.00,  15.00),
-    "claude-3-5-haiku-20241022":  (0.80,   4.00),
-    "claude-3-opus-20240229":     (15.00, 75.00),
-    "claude-3-sonnet-20240229":   (3.00,  15.00),
-    "claude-3-haiku-20240307":    (0.25,   1.25),
-    "claude-sonnet-4-5":          (3.00,  15.00),
-    "claude-opus-4-6":            (15.00, 75.00),
-    "claude-haiku-4-5":           (0.80,   4.00),
+    "claude-3-5-sonnet-20241022": (3.00, 15.00),
+    "claude-3-5-haiku-20241022": (0.80, 4.00),
+    "claude-3-opus-20240229": (15.00, 75.00),
+    "claude-3-sonnet-20240229": (3.00, 15.00),
+    "claude-3-haiku-20240307": (0.25, 1.25),
+    "claude-sonnet-4-5": (3.00, 15.00),
+    "claude-opus-4-6": (15.00, 75.00),
+    "claude-haiku-4-5": (0.80, 4.00),
     # Google
-    "gemini-1.5-pro":       (1.25,  5.00),
-    "gemini-1.5-flash":     (0.075, 0.30),
-    "gemini-2.0-flash":     (0.10,  0.40),
+    "gemini-1.5-pro": (1.25, 5.00),
+    "gemini-1.5-flash": (0.075, 0.30),
+    "gemini-2.0-flash": (0.10, 0.40),
     # Mistral
-    "mistral-large-latest": (2.00,  6.00),
-    "mistral-small-latest": (0.20,  0.60),
+    "mistral-large-latest": (2.00, 6.00),
+    "mistral-small-latest": (0.20, 0.60),
 }
 
 
@@ -71,8 +71,17 @@ def extract_provider(model: str) -> str:
     """Infer the provider name from a litellm model string."""
     if "/" in model:
         prefix = model.split("/")[0]
-        known = {"openai", "anthropic", "google", "mistral", "cohere",
-                 "azure", "bedrock", "vertex_ai", "huggingface"}
+        known = {
+            "openai",
+            "anthropic",
+            "google",
+            "mistral",
+            "cohere",
+            "azure",
+            "bedrock",
+            "vertex_ai",
+            "huggingface",
+        }
         if prefix in known:
             return prefix
     base = model.split("/")[-1].lower()
@@ -93,6 +102,7 @@ def estimate_tokens(text: str, model: str = "gpt-4o") -> int:
     """Best-effort token count when the provider does not return usage."""
     try:
         import tiktoken
+
         try:
             enc = tiktoken.encoding_for_model(model.split("/")[-1])
         except KeyError:

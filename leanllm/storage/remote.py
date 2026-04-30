@@ -2,12 +2,21 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, List
+from datetime import datetime
+from typing import TYPE_CHECKING, List, Optional
 
 from .base import BaseEventStore
 
 if TYPE_CHECKING:
     from ..events.models import LLMEvent
+
+
+_REMOTE_READS_DEFERRED = (
+    "Remote read API (get_event / list_events / count_events) requires the "
+    "LeanLLM SaaS endpoint to expose GET /v1/events. This is on the SaaS "
+    "roadmap and not implemented in the OSS SDK yet — use a Postgres or "
+    "SQLite backend if you need to query events back."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,9 +62,7 @@ class RemoteEventStore(BaseEventStore):
         if not events or self._client is None:
             return
 
-        payload = {
-            "events": [event.model_dump(mode="json") for event in events]
-        }
+        payload = {"events": [event.model_dump(mode="json") for event in events]}
 
         response = await self._client.post(self._url, content=json.dumps(payload))
         response.raise_for_status()
@@ -68,6 +75,37 @@ class RemoteEventStore(BaseEventStore):
             logger.warning(
                 "[LeanLLM] Service accepted %d, dropped %d events.", accepted, dropped
             )
+
+    # ------------------------------------------------------------------
+    # Read API (Module 12) — deferred until SaaS exposes GET /v1/events
+    # ------------------------------------------------------------------
+
+    async def get_event(self, *, event_id: str) -> "Optional[LLMEvent]":
+        raise NotImplementedError(_REMOTE_READS_DEFERRED)
+
+    async def list_events(
+        self,
+        *,
+        correlation_id: Optional[str] = None,
+        model: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        errors_only: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> "List[LLMEvent]":
+        raise NotImplementedError(_REMOTE_READS_DEFERRED)
+
+    async def count_events(
+        self,
+        *,
+        correlation_id: Optional[str] = None,
+        model: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        errors_only: bool = False,
+    ) -> int:
+        raise NotImplementedError(_REMOTE_READS_DEFERRED)
 
     async def close(self) -> None:
         if self._client:

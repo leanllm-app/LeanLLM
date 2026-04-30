@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, List
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 from urllib.parse import urlparse
 
+from ._hydrate import field_names, row_to_event, tuple_to_dict
 from .base import BaseEventStore
 
 if TYPE_CHECKING:
@@ -27,7 +29,7 @@ CREATE TABLE IF NOT EXISTS llm_events (
     prompt                  TEXT,
     response                TEXT,
     metadata                TEXT NOT NULL DEFAULT '{}',
-    schema_version          INTEGER NOT NULL DEFAULT 1,
+    schema_version          INTEGER NOT NULL DEFAULT 2,
     correlation_id          TEXT,
     parent_request_id       TEXT,
     parameters              TEXT NOT NULL DEFAULT '{}',
@@ -75,9 +77,9 @@ def _path_from_url(url: str) -> str:
         return ":memory:"
     raw = urlparse(url).path
     if raw.startswith("//"):
-        return raw[1:]   # absolute → keep one leading slash
+        return raw[1:]  # absolute → keep one leading slash
     if raw.startswith("/"):
-        return raw[1:]   # relative → strip the leading slash
+        return raw[1:]  # relative → strip the leading slash
     return raw or ":memory:"
 
 
@@ -106,8 +108,12 @@ def _to_row(event: "LLMEvent") -> tuple:
         event.total_stream_time_ms,
         event.error_kind.value if event.error_kind else None,
         event.error_message,
-        json.dumps(event.normalized_input.model_dump(mode="json")) if event.normalized_input else None,
-        json.dumps(event.normalized_output.model_dump(mode="json")) if event.normalized_output else None,
+        json.dumps(event.normalized_input.model_dump(mode="json"))
+        if event.normalized_input
+        else None,
+        json.dumps(event.normalized_output.model_dump(mode="json"))
+        if event.normalized_output
+        else None,
     )
 
 
@@ -149,7 +155,119 @@ class SQLiteEventStore(BaseEventStore):
         await self._conn.executemany(_INSERT, rows)
         await self._conn.commit()
 
+    # ------------------------------------------------------------------
+    # Read API (Module 12)
+    # ------------------------------------------------------------------
+
+    async def get_event(self, *, event_id: str) -> "Optional[LLMEvent]":
+        if self._conn is None:
+            return None
+        select_cols = ", ".join(field_names())
+        cursor = await self._conn.execute(
+            f"SELECT {select_cols} FROM llm_events WHERE event_id = ?",
+            (event_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        try:
+            return row_to_event(tuple_to_dict(row))
+        except Exception:
+            logger.exception("[LeanLLM] Failed to hydrate event %s", event_id)
+            return None
+
+    async def list_events(
+        self,
+        *,
+        correlation_id: Optional[str] = None,
+        model: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        errors_only: bool = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> "List[LLMEvent]":
+        if self._conn is None:
+            return []
+        where, params = _build_where(
+            correlation_id=correlation_id,
+            model=model,
+            since=since,
+            until=until,
+            errors_only=errors_only,
+        )
+        select_cols = ", ".join(field_names())
+        sql = (
+            f"SELECT {select_cols} FROM llm_events "
+            f"{where} ORDER BY timestamp DESC LIMIT ? OFFSET ?"
+        )
+        cursor = await self._conn.execute(sql, params + (limit, offset))
+        rows = await cursor.fetchall()
+        events: List["LLMEvent"] = []
+        for row in rows:
+            try:
+                events.append(row_to_event(tuple_to_dict(row)))
+            except Exception:
+                logger.exception(
+                    "[LeanLLM] Skipping un-hydratable row event_id=%s",
+                    row[0],
+                )
+        return events
+
+    async def count_events(
+        self,
+        *,
+        correlation_id: Optional[str] = None,
+        model: Optional[str] = None,
+        since: Optional[datetime] = None,
+        until: Optional[datetime] = None,
+        errors_only: bool = False,
+    ) -> int:
+        if self._conn is None:
+            return 0
+        where, params = _build_where(
+            correlation_id=correlation_id,
+            model=model,
+            since=since,
+            until=until,
+            errors_only=errors_only,
+        )
+        sql = f"SELECT COUNT(*) FROM llm_events {where}"
+        cursor = await self._conn.execute(sql, params)
+        row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
     async def close(self) -> None:
         if self._conn:
             await self._conn.close()
             self._conn = None
+
+
+def _build_where(
+    *,
+    correlation_id: Optional[str],
+    model: Optional[str],
+    since: Optional[datetime],
+    until: Optional[datetime],
+    errors_only: bool,
+) -> Tuple[str, tuple]:
+    """Build a WHERE clause + positional params for SQLite's '?' placeholders."""
+    clauses: List[str] = []
+    params: List[Any] = []
+    if correlation_id is not None:
+        clauses.append("correlation_id = ?")
+        params.append(correlation_id)
+    if model is not None:
+        clauses.append("model = ?")
+        params.append(model)
+    if since is not None:
+        clauses.append("timestamp >= ?")
+        params.append(since.isoformat())
+    if until is not None:
+        clauses.append("timestamp <= ?")
+        params.append(until.isoformat())
+    if errors_only:
+        clauses.append("error_kind IS NOT NULL")
+    if not clauses:
+        return "", tuple()
+    return "WHERE " + " AND ".join(clauses), tuple(params)
